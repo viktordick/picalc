@@ -1,4 +1,5 @@
 use std::ops::DivAssign;
+use std::cmp::{min,max};
 
 const DIGITS: usize = 10_000;
 type Digit = u64;
@@ -13,6 +14,7 @@ type Double = u128;
  */
 #[derive(Clone)]
 struct Number {
+    zeros: usize, // At least the first N digits are zeros
     digits: Vec<Digit>,
 }
 
@@ -21,12 +23,13 @@ impl Number {
         // Create Number that equals zero.
         Number {
             digits: vec![0; DIGITS],
+            zeros: DIGITS,
         }
     }
 
     fn from_inv(x: Digit) -> Number {
         // Create number as inverse of given digit. Since 1.0 can not be represented, we can not
-        // simply use the existing devision method, although the code is quite similar.
+        // simply use the existing division method, although the code is quite similar.
         let x = x as Double;
         let mut rem: Double = 1;
         let mut result = Number::zero();
@@ -35,16 +38,26 @@ impl Number {
             result.digits[i] = (nom / x) as Digit;
             rem = nom % x;
         }
+        result.update_zeros();
         result
     }
 
-    fn is_zero(&self) -> bool {
-        for i in 0..DIGITS {
+    fn update_zeros_min(&mut self, min: usize) {
+        self.zeros = DIGITS;
+        for i in min..DIGITS {
             if self.digits[i] != 0 {
-                return false;
+                self.zeros = i;
+                break;
             }
         }
-        return true;
+    }
+
+    fn update_zeros(&mut self) {
+        self.update_zeros_min(0);
+    }
+
+    fn is_zero(&self) -> bool {
+        self.zeros == DIGITS
     }
 
     fn mul4(&mut self) {
@@ -55,17 +68,23 @@ impl Number {
             self.digits[i] = carry as Digit;
             carry >>= 64;
         }
+        self.update_zeros();
     }
 
     fn set_to_div(&mut self, x: &Self, d: Digit) -> &Self{
         // self = x / d
         let d = d as Double;
         let mut rem: Double = 0;
-        for i in 0..DIGITS {
+        for i in self.zeros..x.zeros {
+            self.digits[i] = 0;
+        }
+
+        for i in x.zeros..DIGITS {
             let num = (rem << 64) + x.digits[i] as Double;
             self.digits[i] = (num / d) as Digit;
             rem = num % d;
         }
+        self.update_zeros_min(x.zeros);
         self
     }
 
@@ -74,24 +93,28 @@ impl Number {
         // These are not implemented with trait AddAssign because that one expects the rhs to be
         // copied or moved, but we want to borrow it.
         let mut carry: Double = 0;
-        for i in (0..DIGITS).rev() {
+        for i in (rhs.zeros..DIGITS).rev() {
             let res = carry + self.digits[i] as Double + rhs.digits[i] as Double;
             self.digits[i] = res as Digit;
             carry = res >> 64;
         }
+        self.update_zeros_min(max(1, min(self.zeros, rhs.zeros))-1);
     }
 
     fn sub_assign(&mut self, rhs: &Self) {
         // self -= rhs
-        let mut carry: Double = 0;
+        let mut carry: Double = 1;
         for i in (0..DIGITS).rev() {
-            let mut res = carry + self.digits[i] as Double + (!rhs.digits[i]) as Double;
-            if i == DIGITS-1 {
-                res += 1;
+            if i < rhs.zeros && carry == 1 {
+                // The rest of the operations will not change anything, can return
+                self.update_zeros_min(min(self.zeros, i+1));
+                return;
             }
+            let res = carry + self.digits[i] as Double + (!rhs.digits[i]) as Double;
             self.digits[i] = res as Digit;
             carry = res >> 64;
         }
+        self.update_zeros();
     }
 
     fn print(&self) {
@@ -111,11 +134,12 @@ impl DivAssign<Digit> for Number {
         // self /= x
         let x = x as Double;
         let mut rem: Double = 0;
-        for i in 0..DIGITS {
+        for i in self.zeros..DIGITS {
             let num = (rem << 64) + self.digits[i] as Double;
             self.digits[i] = (num / x) as Digit;
             rem = num % x;
         }
+        self.update_zeros_min(self.zeros);
     }
 }
 
@@ -127,7 +151,6 @@ fn ataninv(x: Digit) -> Number {
     let mut tmp = Number::zero();
     let mut denom = 1;
     while !term.is_zero() {
-        //println!("{}", term.first_nonzero());
         denom += 2;
         term /= x2;
         tmp.set_to_div(&term, denom);
