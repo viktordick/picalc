@@ -1,6 +1,6 @@
 use std::ops::DivAssign;
 
-const DIGITS: usize = 10_000;
+const DIGITS: usize = 10000;
 
 #[derive(Clone)]
 struct Number {
