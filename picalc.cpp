@@ -4,11 +4,11 @@
 
 const int DIGITS = 10000;
 
+typedef __uint64_t Digit;
 typedef __uint128_t Double;
-typedef __uint64_t Single;
 
 struct Number {
-    std::vector<Single> digits;
+    std::vector<Digit> digits;
     Number() {
         digits.resize(DIGITS);
     };
@@ -45,7 +45,7 @@ struct Number {
         }
     }
 
-    void div(const Number &x, Double d) {
+    void set_to_div(const Number &x, Double d) {
         Double rem = 0;
         for (int i=0; i<DIGITS; i++) {
             auto num = (rem << 64) + x.digits[i];
@@ -109,12 +109,12 @@ Number ataninv(int x) {
     while (!term.is_zero()) {
         denom += 2;
         term /= x2;
-        tmp.div(term, denom);
+        tmp.set_to_div(term, denom);
         result -= tmp;
 
         denom += 2;
         term /= x2;
-        tmp.div(term, denom);
+        tmp.set_to_div(term, denom);
         result += tmp;
     }
 
