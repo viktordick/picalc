@@ -161,96 +161,120 @@ impl DivAssign<Digit> for Number {
     }
 }
 
-struct Workspace {
-    // Collection of Numbers and additional info that are needed by a thread to compute a term in
-    // the Taylor sum. A Workspace is moved through the channel to a worker that is ready to do
-    // some work, which returns it once it is finished.
+struct Term {
+    // One val in the Taylor series, i.e. 1/x^n, where n is an odd number. This structure is
+    // passed to the threads as workspace that is returned when no longer needed. In each step, the
+    // thread reduces the given value to the currently needed one, which only works for not too
+    // large steps (i.e., the divisor needs to be u64).
 
     // Current denominator in Taylor series
-    cur_denom: Digit,
-    // Number that always holds 1/x^denom
-    term: Number,
-    // Denominator that is to be computed
     denom: Digit,
-    // squared argument to ataninv
-    x2: Digit,
-    // Result number - 1/(denom * x^denom)
-    result: Number,
-    // Flag that term is zero
-    term_zero: bool,
-    // If term is to be understood to be negative
-    negative: bool,
+    // Number that always holds 1/x^denom
+    val: Number,
 }
 
-impl Workspace {
-    fn init(x2: Digit, xinv: &Number, denom: Digit, negative: bool) -> Self {
-        // Initialize workspace
-        Workspace {
-            cur_denom: 1,
-            denom: denom,
-            x2: x2,
-            term: xinv.clone(),
-            result: Number::zero(),
-            term_zero: false,
-            negative: negative,
+impl Term {
+    fn init(xinv: &Number) -> Self {
+        // Initialize
+        Term {
+            denom: 1,
+            val: xinv.clone(),
         }
     }
-    fn proc(&mut self) {
-        let divisor = match self.x2.checked_pow(((self.denom - self.cur_denom)/2) as u32) {
+    fn copy_from(&mut self, rhs: &Term) {
+        self.val.set(&rhs.val);
+        self.denom = rhs.denom;
+    }
+    fn update(&mut self, x2: Digit, denom: Digit) {
+        let divisor = match x2.checked_pow(((denom - self.denom)/2) as u32) {
             Some(d) => d,
             None => {
-                println!("{} {} {}", self.x2, self.denom, self.cur_denom);
-                panic!("Difference too lange");
+                println!("{} {} {}", x2, denom, self.denom);
+                panic!("Difference too large");
             }
         };
-        self.term /= divisor;
-        self.cur_denom = self.denom;
-        self.result.set_to_div(&self.term, self.denom);
-        self.term_zero = self.term.is_zero();
+        self.val /= divisor;
+        self.denom = denom;
     }
 }
 
-fn calc(rcv: Receiver<Workspace>, snd: Sender<Workspace>) {
+struct Thread {
+    result: Number,
+    tmp: Number,
+    x2: Digit,
+    snd: Sender<Term>,
+}
+
+impl Thread {
+    fn step(&mut self, mut denom: Digit, mut t1: Term, mut t2: Term) {
+        t1.update(self.x2, denom);
+        self.tmp.set_to_div(&t1.val, denom);
+        // we ignore the value that t2 came with, t1 is closer to the target denom
+        t2.copy_from(&t1);
+        self.snd.send(t1).unwrap();
+        self.result.add_assign(&self.tmp);
+
+        denom += 2;
+        t2.update(self.x2, denom);
+        self.tmp.set_to_div(&t2.val, denom);
+        self.snd.send(t2).unwrap();
+        self.result.sub_assign(&self.tmp);
+    }
+}
+
+fn calc(x2: Digit, rcv: Receiver<(Digit, Term, Term)>, snd: Sender<Term>,
+        snd_res: Sender<Number>) {
+    // Worker loop. Collect result by iteratively receiving two terms, updating them as necessary
+    // to compute 1/dx^d - 1/(d+2)x^(d+2), which is added to the result. Send the terms back
+    // separately as soon as possible so the intermediate result can more quickly be used by
+    // another thread.
+    // Send the final result back to the main thread once the loop is done.
+    let mut me = Thread {
+        result: Number::zero(),
+        tmp: Number::zero(),
+        x2: x2,
+        snd: snd,
+    };
     loop {
-        // Receive a workspace
-        match rcv.recv() {
-            Ok(mut wsp) => {
-                // Process
-                wsp.proc();
-                // Send result
-                snd.send(wsp).unwrap();
-            },
+        let (denom, t1, t2) = match rcv.recv() {
+            Ok(x) => x,
             Err(_) => break,
+        };
+        if t1.denom > t2.denom {
+            me.step(denom, t1, t2);
+        } else {
+            me.step(denom, t2, t1);
         }
     }
+    snd_res.send(me.result).unwrap();
 }
 
 fn ataninv(x: Digit) -> Number {
     // Calculate atan(1/x) using Taylor expansion
     let mut result = Number::from_inv(x);
     let x2 = x*x;
-    let mut denom: Digit = 1;
-    let mut negative = false;
+    let mut denom: Digit = 3;
     let mut running = 0;
-    // We always store a copy of the term of the completed Workspace with the highest denominator,
-    // so we can push Workspaces to this denominator before they are started again, so the jump is
-    // not too large - the reason being that we need to divide the term by x2^(diff of denoms),
+    // We always store a copy of the val of the completed Term with the highest denominator,
+    // so we can push Terms to this denominator before they are started again, so the jump is
+    // not too large - the reason being that we need to divide the val by x2^(diff of denoms),
     // which might become too large for u64.
     let mut refdenom = 1;
-    let mut refterm = Number::zero();
-    refterm.set(&result);
+    let mut refval = Number::zero();
+    refval.set(&result);
 
     let (snd_main, rcv_thrd) = unbounded();
     let (snd_thrd, rcv_main) = unbounded();
+    let (snd_res, rcv_res) = unbounded();
+
     for _ in 0..MAXTHREADS+1 {
-        denom += 2;
-        negative = !negative;
-        let wsp = Workspace::init(x2, &result, denom, negative);
-        snd_main.send(wsp).unwrap();
+        snd_main.send((denom, Term::init(&result), Term::init(&result))).unwrap();
         running += 1;
+        denom += 4;
+
         // If the number of threads requires a too large jump in the divisor, we break even though
         // we might use more threads.
-        match x2.checked_pow(((denom+1)/2) as u32) {
+        match x2.checked_pow(((denom-1)/2) as u32) {
             Some(_) => (),
             None => break
         }
@@ -260,44 +284,51 @@ fn ataninv(x: Digit) -> Number {
     for _ in 0..min(running, MAXTHREADS) {
         let rcv = rcv_thrd.clone();
         let snd = snd_thrd.clone();
+        let snd_res = snd_res.clone();
         thread::spawn(move || {
-            calc(rcv, snd);
+            calc(x2, rcv, snd, snd_res);
         });
     }
 
+    drop(rcv_thrd);
+    drop(snd_thrd);
+    drop(snd_res);
+    running *= 2;
+
     let mut refoutput = 1000;
 
-    for mut wsp in rcv_main {
-        if wsp.negative {
-            result.sub_assign(&wsp.result);
-        } else {
-            result.add_assign(&wsp.result);
-        }
-        if wsp.term.zeros >= refoutput {
-            println!("{}", wsp.term.zeros);
+    let mut buffer: Option<Term> = None;
+    for mut term in rcv_main {
+        running -= 1;
+        if term.val.zeros >= refoutput {
             refoutput += 1000;
         }
-        if wsp.term_zero {
-            running -= 1;
+        if term.val.is_zero() {
+            if running == 0 {
+                drop(snd_main);
+                break;
+            }
+            continue;
+        }
+
+        if term.denom > refdenom {
+            refval.set(&term.val);
+            refdenom = term.denom;
+        }
+        if refdenom > term.denom {
+            term.val.set(&refval);
+            term.denom = refdenom;
+        }
+        if buffer.is_some() {
+            snd_main.send((denom, buffer.take().unwrap(), term)).unwrap();
+            denom += 4;
+            running += 2;
         } else {
-            if wsp.cur_denom > refdenom {
-                refterm.set(&wsp.term);
-                refdenom = wsp.cur_denom;
-            }
-            if refdenom > wsp.cur_denom {
-                wsp.term.set(&refterm);
-                wsp.cur_denom = refdenom;
-            }
-            denom += 2;
-            negative = !negative;
-            wsp.denom = denom;
-            wsp.negative = negative;
-            snd_main.send(wsp).unwrap();
+            buffer.get_or_insert(term);
         }
-        if running == 0 {
-            drop(snd_main);
-            break
-        }
+    }
+    for val in rcv_res {
+        result.sub_assign(&val);
     }
     result
 }
@@ -305,20 +336,20 @@ fn ataninv(x: Digit) -> Number {
 //fn ataninv(x: Digit) -> Number {
 //    let mut result = Number::from_inv(x);
 //    let x2 = x*x;
-//    let mut term = result.clone();
+//    let mut val = result.clone();
 //    let mut tmp = Number::zero();
 //    let mut denom = 1;
 //    let starttime = Instant::now();
 //    let mut iters = 0;
-//    while !term.is_zero() {
+//    while !val.is_zero() {
 //        denom += 2;
-//        term /= x2;
-//        tmp.set_to_div(&term, denom);
+//        val /= x2;
+//        tmp.set_to_div(&val, denom);
 //        result.sub_assign(&tmp);
 
 //        denom += 2;
-//        term /= x2;
-//        tmp.set_to_div(&term, denom);
+//        val /= x2;
+//        tmp.set_to_div(&val, denom);
 //        result.add_assign(&tmp);
 //        iters += 1;
 //    }
