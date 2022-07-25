@@ -1,10 +1,11 @@
 use std::ops::DivAssign;
 use std::cmp::{min,max};
 use std::thread;
+use std::vec::Vec;
 use crossbeam::{channel::{unbounded,Receiver,Sender}};
 use std::time::Instant;
 
-const DIGITS: usize = 10_000;
+const DIGITS: usize = 20_000;
 type Digit = u64;
 type Double = u128;
 
@@ -189,7 +190,6 @@ impl Term {
         self.denom = rhs.denom;
     }
     fn update(&mut self, x2: Digit, denom: Digit) {
-        // println!("{} => {}", self.denom, denom);
         let divisor = match x2.checked_pow(((denom - self.denom)/2) as u32) {
             Some(d) => d,
             None => {
@@ -202,20 +202,19 @@ impl Term {
     }
 }
 
-fn calc(x2: Digit, rcv: Receiver<(bool, Digit, Term)>, snd: Sender<Term>,
+fn calc(rcv: Receiver<(bool, Digit, Term)>, snd: Sender<Term>,
         snd_res: Sender<Number>) {
-    // Worker thread. Iteratively receive a term and which denominator is to be calculated,
-    // update the Term to the value 1/x^d and add or subtract 1/(dx^d) to the result. Once no more
-    // terms are received, pass the result to the main thread, which sums them together.
+    // Worker thread. Iteratively receive a term and divisor and add or subtract the resulting
+    // Taylor term to the result. Once no more terms are received, pass the result to the main
+    // thread, which sums them together.
     let mut result = Number::zero();
     let mut tmp = Number::zero();
     loop {
-        let (neg, denom, mut term) = match rcv.recv() {
+        let (neg, div, term) = match rcv.recv() {
             Ok(x) => x,
             Err(_) => break,
         };
-        term.update(x2, denom);
-        tmp.set_to_div(&term.val, denom);
+        tmp.set_to_div(&term.val, div);
         snd.send(term).unwrap();
         if neg {
             result.sub_assign(&tmp);
@@ -238,36 +237,20 @@ fn ataninv(x: Digit) -> Number {
     // not too large - the reason being that we need to divide the val by x2^(diff of denoms)
     // and the fact that this needs to fit into u64 is a restriction on the number of terms that
     // can be handled at the same time.
-    let mut refterm = Term {
-        denom: 1,
-        val: result.clone(),
-    };
+    let mut refterm = Term::init(&result);
 
     let (snd_main, rcv_thrd) = unbounded();
     let (snd_thrd, rcv_main) = unbounded();
     let (snd_res, rcv_res) = unbounded();
 
-    for _ in 0..MAXTHREADS+1 {
-        negative = !negative;
-        denom += 2;
-        snd_main.send((negative, denom, Term::init(&result))).unwrap();
-        running += 1;
-
-        // If the number of threads requires a too large jump in the divisor, we break even though
-        // we might use more threads.
-        match x2.checked_pow(((denom+1)/2) as u32) {
-            Some(_) => (),
-            None => break
-        }
-    }
-    
-    println!("Created {} tasks.", running);
-    for _ in 0..min(running, MAXTHREADS) {
+    let mut terms = Vec::new();
+    for _ in 0..MAXTHREADS {
+        terms.push(Term::init(&result));
         let rcv = rcv_thrd.clone();
         let snd = snd_thrd.clone();
         let snd_res = snd_res.clone();
         thread::spawn(move || {
-            calc(x2, rcv, snd, snd_res);
+            calc(rcv, snd, snd_res);
         });
     }
 
@@ -275,11 +258,17 @@ fn ataninv(x: Digit) -> Number {
     drop(snd_thrd);
     drop(snd_res);
 
-    let mut refoutput = 1000;
-    for mut term in rcv_main {
-        if term.val.zeros >= refoutput {
-            refoutput += 1000;
-        }
+    loop {
+        let mut term = match terms.pop() {
+            Some(x) => {
+                running += 1;
+                x
+            },
+            None => match rcv_main.recv() {
+                Ok(x) => x,
+                Err(_) => break,
+            },
+        };
         if term.val.is_zero() {
             running -= 1;
             if running == 0 {
@@ -289,14 +278,26 @@ fn ataninv(x: Digit) -> Number {
             continue;
         }
 
-        if term.denom > refterm.denom {
-            refterm.copy_from(&term);
-        } else {
+        denom += 2;
+        negative = !negative;
+        let mut div = denom as Double *
+            match x2.checked_pow(((denom-refterm.denom)/2) as u32) {
+                Some(x) => x as Double,
+                None => 0,
+            };
+        if div != 0 && (div >> 64) != 0 {
+            // Move refterm forward, the step is too large
+            refterm.update(x2, denom);
+            div = denom as Double;
+        } else if div  == 0 {
+            // Even before multiplying with denom, it is too large.
+            refterm.update(x2, denom-2);
+            div = (denom * x2) as Double;
+        }
+        if term.denom < refterm.denom {
             term.copy_from(&refterm);
         }
-        negative = !negative;
-        denom += 2;
-        snd_main.send((negative, denom, term)).unwrap();
+        snd_main.send((negative, div as Digit, term)).unwrap();
     }
     for val in rcv_res {
         result.add_assign(&val);
@@ -358,16 +359,16 @@ fn ataninv_scalar(x: Digit) -> Number {
 fn main() {
     // Calculate pi using pi/4 = 4atan(1/5)-atan(1/239)
     let mut start = Instant::now();
-    let mut pi = ataninv_scalar(5);
+    let mut pi = ataninv(5);
     pi.mul4();
     let t1 = start.elapsed();
     start = Instant::now();
-    pi.sub_assign(&ataninv_scalar(239));
+    pi.sub_assign(&ataninv(239));
     let t2 = start.elapsed();
     // Note that this takes the number outside the representable range by creating a value larger
     // than one, which overflows and drops the integer part, but that one is known to be 3.
     pi.mul4();
-    //pi.print();
+    pi.print();
     println!("{}.{:03} {}.{:03}",
              t1.as_secs(), t1.subsec_millis(), t2.as_secs(), t2.subsec_millis());
 }
