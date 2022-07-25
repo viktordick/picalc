@@ -232,11 +232,10 @@ fn ataninv(x: Digit) -> Number {
     let mut denom: Digit = 1;
     let mut negative = false;
     let mut running = 0;
-    // We always store a copy of the val of the completed Term with the highest denominator,
-    // so we can push Terms to this denominator before they are started again, so the jump is
-    // not too large - the reason being that we need to divide the val by x2^(diff of denoms)
-    // and the fact that this needs to fit into u64 is a restriction on the number of terms that
-    // can be handled at the same time.
+    // Reference term. This starts with 1/x. Every time a task is created, we check if the target
+    // term can be obtained from this using a division by a u64 number. If that is not possible,
+    // because the divisor becomes too big, the reference term is updated to a smaller value, to
+    // make the jump distance smaller.
     let mut refterm = Term::init(&result);
 
     let (snd_main, rcv_thrd) = unbounded();
@@ -244,8 +243,10 @@ fn ataninv(x: Digit) -> Number {
     let (snd_res, rcv_res) = unbounded();
 
     let mut terms = Vec::new();
-    for _ in 0..MAXTHREADS {
+    for _ in 0..MAXTHREADS+5 {
         terms.push(Term::init(&result));
+    }
+    for _ in 0..MAXTHREADS {
         let rcv = rcv_thrd.clone();
         let snd = snd_thrd.clone();
         let snd_res = snd_res.clone();
