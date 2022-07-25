@@ -4,7 +4,7 @@ use std::thread;
 use crossbeam::{channel::{unbounded,Receiver,Sender}};
 use std::time::Instant;
 
-const DIGITS: usize = 20_000;
+const DIGITS: usize = 10_000;
 type Digit = u64;
 type Double = u128;
 
@@ -189,6 +189,7 @@ impl Term {
         self.denom = rhs.denom;
     }
     fn update(&mut self, x2: Digit, denom: Digit) {
+        // println!("{} => {}", self.denom, denom);
         let divisor = match x2.checked_pow(((denom - self.denom)/2) as u32) {
             Some(d) => d,
             None => {
@@ -304,24 +305,48 @@ fn ataninv(x: Digit) -> Number {
     result
 }
 
+fn calc_term(tmp: &mut Number, term: &mut Term, denom: Digit, x2: Digit) {
+    // Set tmp to 1/(denom*x^denom). If the step is too large, update term.
+    // Case 1: denom*x^(denom-term.denom) fits into u64.
+    //         We leave term as it is and only need one division.
+    // Case 2: It does not, but x^(denom-term.denom) does.
+    //         We update term so term.denom becomes denom and calculate tmp from there.
+    // Case 3: Neither does. Update term s.t. term.denom becomes denom-2, calculate tmp.
+    let divisor = denom as Double *
+        match x2.checked_pow(((denom - term.denom)/2) as u32) {
+            Some(d) => d,
+            None => 0,
+        } as Double;
+    if divisor != 0 && (divisor >> 64) == 0 {
+        tmp.set_to_div(&term.val, divisor as Digit);
+    } else if divisor != 0 {
+        term.update(x2, denom);
+        tmp.set_to_div(&term.val, denom);
+    } else {
+        term.update(x2, denom-2);
+        tmp.set_to_div(&term.val, denom*x2);
+    }
+}
+
 #[allow(dead_code)]
 fn ataninv_scalar(x: Digit) -> Number {
     let mut result = Number::from_inv(x);
     let x2 = x*x;
-    let mut val = result.clone();
+    let mut term = Term {
+        val: result.clone(),
+        denom: 1,
+    };
     let mut tmp = Number::zero();
     let mut denom = 1;
     let starttime = Instant::now();
     let mut iters = 0;
-    while !val.is_zero() {
+    while !term.val.is_zero() {
         denom += 2;
-        val /= x2;
-        tmp.set_to_div(&val, denom);
+        calc_term(&mut tmp, &mut term, denom, x2);
         result.sub_assign(&tmp);
 
         denom += 2;
-        val /= x2;
-        tmp.set_to_div(&val, denom);
+        calc_term(&mut tmp, &mut term, denom, x2);
         result.add_assign(&tmp);
         iters += 1;
     }
@@ -333,11 +358,11 @@ fn ataninv_scalar(x: Digit) -> Number {
 fn main() {
     // Calculate pi using pi/4 = 4atan(1/5)-atan(1/239)
     let mut start = Instant::now();
-    let mut pi = ataninv(5);
+    let mut pi = ataninv_scalar(5);
     pi.mul4();
     let t1 = start.elapsed();
     start = Instant::now();
-    pi.sub_assign(&ataninv(239));
+    pi.sub_assign(&ataninv_scalar(239));
     let t2 = start.elapsed();
     // Note that this takes the number outside the representable range by creating a value larger
     // than one, which overflows and drops the integer part, but that one is known to be 3.
