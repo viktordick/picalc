@@ -16,7 +16,7 @@ const MAXTHREADS: usize = 7;
  * with DIGITS digits, each of base 2^64. For DIGITS = 10_000, this means 160_000 hexadecimal or
  * 640_000 binary digits. We only implement methods needed for the algorithm, which includes
  * a) addition and subtraction and
- * b) multiplication by 4 and division by a small (u64) number (only for positiv Numbers.
+ * b) multiplication by 4 and division by a small (u64) number (only for positive Numbers).
  */
 #[derive(Clone)]
 struct Number {
@@ -40,7 +40,7 @@ impl Number {
         let mut rem: Double = 1;
         let mut result = Number::zero();
         for i in 0..DIGITS {
-            let nom = rem << 64;
+            let nom = rem << Digit::BITS;
             result.digits[i] = (nom / x) as Digit;
             rem = nom % x;
         }
@@ -48,22 +48,16 @@ impl Number {
         result
     }
 
-    fn set(&mut self, rhs: &Number) {
+    fn copy_from(&mut self, rhs: &Number) {
         for i in 0..DIGITS {
             self.digits[i] = rhs.digits[i];
         }
         self.zeros = rhs.zeros;
     }
 
-    #[allow(dead_code)]
-    fn set_zero(&mut self) {
-        for i in 0..DIGITS {
-            self.digits[i] = 0;
-        }
-        self.zeros = DIGITS;
-    }
-
     fn update_zeros_min(&mut self, min: usize) {
+        // Update how many leading digits are zeros, under the assumption that there are at least
+        // min
         self.zeros = DIGITS;
         for i in min..DIGITS {
             if self.digits[i] != 0 {
@@ -87,12 +81,12 @@ impl Number {
         for i in (0..DIGITS).rev() {
             carry += 4*self.digits[i] as Double;
             self.digits[i] = carry as Digit;
-            carry >>= 64;
+            carry >>= Digit::BITS;
         }
         self.update_zeros();
     }
 
-    fn set_to_div(&mut self, x: &Self, d: Digit) -> &Self{
+    fn set_to_div(&mut self, x: &Self, d: Digit) {
         // self = x / d
         let d = d as Double;
         let mut rem: Double = 0;
@@ -101,12 +95,11 @@ impl Number {
         }
 
         for i in x.zeros..DIGITS {
-            let num = (rem << 64) + x.digits[i] as Double;
+            let num = (rem << Digit::BITS) + x.digits[i] as Double;
             self.digits[i] = (num / d) as Digit;
             rem = num % d;
         }
         self.update_zeros_min(x.zeros);
-        self
     }
 
     fn add_assign(&mut self, rhs: &Self) {
@@ -117,7 +110,7 @@ impl Number {
         for i in (rhs.zeros..DIGITS).rev() {
             let res = carry + self.digits[i] as Double + rhs.digits[i] as Double;
             self.digits[i] = res as Digit;
-            carry = res >> 64;
+            carry = res >> Digit::BITS;
         }
         self.update_zeros_min(max(1, min(self.zeros, rhs.zeros))-1);
     }
@@ -133,7 +126,7 @@ impl Number {
             }
             let res = carry + self.digits[i] as Double + (!rhs.digits[i]) as Double;
             self.digits[i] = res as Digit;
-            carry = res >> 64;
+            carry = res >> Digit::BITS;
         }
         self.update_zeros();
     }
@@ -186,24 +179,17 @@ impl Term {
         }
     }
     fn copy_from(&mut self, rhs: &Term) {
-        self.val.set(&rhs.val);
+        self.val.copy_from(&rhs.val);
         self.denom = rhs.denom;
-    }
-    fn update(&mut self, x2: Digit, denom: Digit) {
-        let divisor = match x2.checked_pow(((denom - self.denom)/2) as u32) {
-            Some(d) => d,
-            None => {
-                println!("{} {} {}", x2, denom, self.denom);
-                panic!("Difference too large");
-            }
-        };
-        self.val /= divisor;
-        self.denom = denom;
     }
 }
 
-fn calc(rcv: Receiver<(bool, Digit, Term)>, snd: Sender<Term>,
-        snd_res: Sender<Number>) {
+enum Msg {
+    Number(Number),
+    Term(Term),
+}
+
+fn calc(rcv: Receiver<(bool, Digit, Term)>, snd: Sender<Msg>,) {
     // Worker thread. Iteratively receive a term and divisor and add or subtract the resulting
     // Taylor term to the result. Once no more terms are received, pass the result to the main
     // thread, which sums them together.
@@ -215,32 +201,31 @@ fn calc(rcv: Receiver<(bool, Digit, Term)>, snd: Sender<Term>,
             Err(_) => break,
         };
         tmp.set_to_div(&term.val, div);
-        snd.send(term).unwrap();
+        if tmp.is_zero() {
+            snd.send(Msg::Number(result)).unwrap();
+            break;
+        }
+        snd.send(Msg::Term(term)).unwrap();
         if neg {
             result.sub_assign(&tmp);
         } else {
             result.add_assign(&tmp);
         };
     }
-    snd_res.send(result).unwrap();
 }
 
 fn ataninv(x: Digit) -> Number {
     // Calculate atan(1/x) using Taylor expansion
+
     let mut result = Number::from_inv(x);
-    let x2 = x*x;
-    let mut denom: Digit = 1;
-    let mut negative = false;
-    let mut running = 0;
     // Reference term. This starts with 1/x. Every time a task is created, we check if the target
     // term can be obtained from this using a division by a u64 number. If that is not possible,
-    // because the divisor becomes too big, the reference term is updated to a smaller value, to
+    // because the divisor becomes too large, the reference term is updated to a smaller value, to
     // make the jump distance smaller.
     let mut refterm = Term::init(&result);
 
     let (snd_main, rcv_thrd) = unbounded();
     let (snd_thrd, rcv_main) = unbounded();
-    let (snd_res, rcv_res) = unbounded();
 
     let mut terms = Vec::new();
     for _ in 0..MAXTHREADS+5 {
@@ -249,111 +234,54 @@ fn ataninv(x: Digit) -> Number {
     for _ in 0..MAXTHREADS {
         let rcv = rcv_thrd.clone();
         let snd = snd_thrd.clone();
-        let snd_res = snd_res.clone();
         thread::spawn(move || {
-            calc(rcv, snd, snd_res);
+            calc(rcv, snd);
         });
     }
 
     drop(rcv_thrd);
     drop(snd_thrd);
-    drop(snd_res);
 
+    let x2 = x*x;
+    // current power of x for the Taylor series
+    let mut denom: Digit = 1;
+    // x^(denom-refterm.denom)
+    let mut stepsize: Digit = 1;
+    // current sign of the next term.
+    let mut negative = false;
     loop {
+        // Push a few tasks from the vector. Once it is depleted, create tasks by reusing terms
+        // that were given back by a processing thread.
         let mut term = match terms.pop() {
-            Some(x) => {
-                running += 1;
-                x
-            },
+            Some(x) => x,
             None => match rcv_main.recv() {
-                Ok(x) => x,
+                Ok(msg) => match msg {
+                    Msg::Term(x) => x,
+                    Msg::Number(x) => {
+                        result.add_assign(&x);
+                        continue;
+                    },
+                },
                 Err(_) => break,
             },
         };
-        if term.val.is_zero() {
-            running -= 1;
-            if running == 0 {
-                drop(snd_main);
-                break;
-            }
-            continue;
-        }
 
         denom += 2;
         negative = !negative;
-        let mut div = denom as Double *
-            match x2.checked_pow(((denom-refterm.denom)/2) as u32) {
-                Some(x) => x as Double,
-                None => 0,
-            };
-        if div != 0 && (div >> 64) != 0 {
-            // Move refterm forward, the step is too large
-            refterm.update(x2, denom);
-            div = denom as Double;
-        } else if div  == 0 {
-            // Even before multiplying with denom, it is too large.
-            refterm.update(x2, denom-2);
-            div = (denom * x2) as Double;
-        }
+        stepsize *= x2;
+        if denom as Double * stepsize as Double > Digit::MAX.into() {
+            refterm.val /= stepsize;
+            refterm.denom = denom;
+            stepsize = 1;
+        };
         if term.denom < refterm.denom {
             term.copy_from(&refterm);
         }
-        snd_main.send((negative, div as Digit, term)).unwrap();
-    }
-    for val in rcv_res {
-        result.add_assign(&val);
+        // Errors here are not a problem. All threads already encountered a zero term and
+        // terminated. We prepared too many terms, but they will also be zero.
+        let _ = snd_main.send((negative, denom*stepsize, term));
     }
     println!("{}", denom);
-    result
-}
-
-fn calc_term(tmp: &mut Number, term: &mut Term, denom: Digit, x2: Digit) {
-    // Set tmp to 1/(denom*x^denom). If the step is too large, update term.
-    // Case 1: denom*x^(denom-term.denom) fits into u64.
-    //         We leave term as it is and only need one division.
-    // Case 2: It does not, but x^(denom-term.denom) does.
-    //         We update term so term.denom becomes denom and calculate tmp from there.
-    // Case 3: Neither does. Update term s.t. term.denom becomes denom-2, calculate tmp.
-    let divisor = denom as Double *
-        match x2.checked_pow(((denom - term.denom)/2) as u32) {
-            Some(d) => d,
-            None => 0,
-        } as Double;
-    if divisor != 0 && (divisor >> 64) == 0 {
-        tmp.set_to_div(&term.val, divisor as Digit);
-    } else if divisor != 0 {
-        term.update(x2, denom);
-        tmp.set_to_div(&term.val, denom);
-    } else {
-        term.update(x2, denom-2);
-        tmp.set_to_div(&term.val, denom*x2);
-    }
-}
-
-#[allow(dead_code)]
-fn ataninv_scalar(x: Digit) -> Number {
-    let mut result = Number::from_inv(x);
-    let x2 = x*x;
-    let mut term = Term {
-        val: result.clone(),
-        denom: 1,
-    };
-    let mut tmp = Number::zero();
-    let mut denom = 1;
-    let starttime = Instant::now();
-    let mut iters = 0;
-    while !term.val.is_zero() {
-        denom += 2;
-        calc_term(&mut tmp, &mut term, denom, x2);
-        result.sub_assign(&tmp);
-
-        denom += 2;
-        calc_term(&mut tmp, &mut term, denom, x2);
-        result.add_assign(&tmp);
-        iters += 1;
-    }
-    let elapsed = starttime.elapsed();
-    println!("{} {}.{}", iters, elapsed.as_secs(), elapsed.subsec_millis());
     result
 }
 
