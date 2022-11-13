@@ -11,3 +11,4 @@ sum
 *.dat
 fit.log
 Cargo.lock
+picalc

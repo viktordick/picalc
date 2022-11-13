@@ -1,15 +1,13 @@
 use std::ops::DivAssign;
 use std::cmp::{min,max};
 use std::thread;
+use std::env;
 use std::vec::Vec;
 use crossbeam::{channel::{unbounded,Receiver,Sender}};
-use std::time::Instant;
 
-const DIGITS: usize = 20_000;
+const DIGITS: usize = 10_000;
 type Digit = u64;
 type Double = u128;
-
-const MAXTHREADS: usize = 7;
 
 /*
  * Number represents a number between -0.5 (incl.) and 0.5 (excl.). It uses fixed precision
@@ -214,7 +212,7 @@ fn calc(rcv: Receiver<(bool, Digit, Term)>, snd: Sender<Msg>,) {
     }
 }
 
-fn ataninv(x: Digit) -> Number {
+fn ataninv_threaded(x: Digit, nthreads: usize) -> Number {
     // Calculate atan(1/x) using Taylor expansion
 
     let mut result = Number::from_inv(x);
@@ -228,10 +226,10 @@ fn ataninv(x: Digit) -> Number {
     let (snd_thrd, rcv_main) = unbounded();
 
     let mut terms = Vec::new();
-    for _ in 0..MAXTHREADS+5 {
+    for _ in 0..nthreads+2 {
         terms.push(Term::init(&result));
     }
-    for _ in 0..MAXTHREADS {
+    for _ in 0..nthreads {
         let rcv = rcv_thrd.clone();
         let snd = snd_thrd.clone();
         thread::spawn(move || {
@@ -281,23 +279,63 @@ fn ataninv(x: Digit) -> Number {
         // terminated. We prepared too many terms, but they will also be zero.
         let _ = snd_main.send((negative, denom*stepsize, term));
     }
-    println!("{}", denom);
     result
+}
+
+fn ataninv_scalar(x: Digit) -> Number {
+    let x2 = x*x;
+    let mut result = Number::from_inv(x);
+    let mut refterm = result.clone();
+    let mut tmp = Number::zero();
+    // the counting variable, k in the term 1/(k x^2k)
+    let mut denom: Digit = 1;
+    // x^2k * refterm - i.e., how many powers of x^2 refterm lags behind
+    let mut stepsize: Digit = 1;
+    let mut neg = true;
+    while !refterm.is_zero() {
+        denom += 2;
+        stepsize *= x2;
+        let mut divisor = denom as Double * stepsize as Double;
+        if divisor > Digit::MAX.into() {
+            refterm /= stepsize;
+            stepsize = 1;
+            divisor = denom as Double;
+        }
+        tmp.set_to_div(&refterm, divisor as Digit);
+        if neg {
+            result.sub_assign(&tmp);
+        } else {
+            result.add_assign(&tmp);
+        }
+        neg = !neg;
+    }
+    result
+}
+
+fn ataninv(x: Digit, nthreads: usize) -> Number {
+    if nthreads == 0 {
+        ataninv_scalar(x)
+    } else {
+        ataninv_threaded(x, nthreads)
+    }
 }
 
 fn main() {
     // Calculate pi using pi/4 = 4atan(1/5)-atan(1/239)
-    let mut start = Instant::now();
-    let mut pi = ataninv(5);
+    let args: Vec<String> = env::args().collect();
+    let nt1 = args[1].parse::<usize>().unwrap();
+    let nt2 = args[2].parse::<usize>().unwrap();
+    let (snd, rcv) = unbounded();
+    thread::spawn(move || {
+        let x = ataninv(239, nt2);
+        snd.send(x).unwrap();
+    });
+
+    let mut pi = ataninv(5, nt1);
     pi.mul4();
-    let t1 = start.elapsed();
-    start = Instant::now();
-    pi.sub_assign(&ataninv(239));
-    let t2 = start.elapsed();
+    pi.sub_assign(&rcv.recv().unwrap());
     // Note that this takes the number outside the representable range by creating a value larger
     // than one, which overflows and drops the integer part, but that one is known to be 3.
     pi.mul4();
-    pi.print();
-    println!("{}.{:03} {}.{:03}",
-             t1.as_secs(), t1.subsec_millis(), t2.as_secs(), t2.subsec_millis());
+    //pi.print();
 }
