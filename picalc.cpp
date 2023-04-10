@@ -2,7 +2,7 @@
 #include <iostream>
 #include <iomanip>
 
-const int DIGITS = 20000;
+const int DIGITS = 10000;
 
 typedef __uint64_t Digit;
 typedef __uint128_t Double;
