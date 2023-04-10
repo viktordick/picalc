@@ -322,15 +322,8 @@ fn ataninv_threaded(x: Digit, nthreads: usize) -> Number {
     result
 }
 
-// Alternative strategy: try moving all divisions and additions into the worker threads.
-// Only copying and single-digit calculations in the main thread.
-// Maybe foresee if a new refterm is going to be needed once each thread performs another division.
-// Then signal the next thread that it should update the refterm instead of calculating an actual
-// term. Example: We foresee that we can create another X tasks before needing an updated refterm.
-// We have Y threads running. We create X-Y+1 tasks for new terms, then one task to update the
-// refterm, then Y-1 tasks for more terms. Before creating new tasks, we need to wait for the
-// updating task to be finished.
 
+// Alternate strategy - update refterm inside worker thread
 struct TaskParams {
     neg: bool,
     // Divisor
